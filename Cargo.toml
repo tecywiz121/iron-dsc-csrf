@@ -1,0 +1,21 @@
+[package]
+name = "iron-dsc-csrf"
+description = "Iron middleware providing CSRF protection."
+version = "0.1.0"
+authors = ["Sam Wilson <tecywiz121@hotmail.com>"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/tecywiz121/iron-dsc-csrf"
+documentation = "https://docs.rs/iron-dsc-csrf"
+
+[dependencies]
+cookie = "0.10.1"
+iron = "0.6.0"
+rand = "0.4.2"
+subtle = "0.3.0"
+base64 = "0.9.0"
+
+[dev-dependencies]
+iron-test = "0.6.0"
+assert_matches = "1.1.0"
+clippy = "=0.0.180"
