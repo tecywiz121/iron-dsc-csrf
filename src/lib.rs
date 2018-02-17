@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(new_without_default_derive))] // Seems broken in clippy 0.0.186
 #![cfg_attr(test, feature(plugin))]
 #![cfg_attr(test, plugin(clippy))]
 #![deny(missing_docs)]
@@ -30,29 +31,50 @@
 //! extern crate iron_dsc_csrf;
 //! extern crate iron;
 //!
-//! use iron_dsc_csrf::Csrf;
-//! use iron::AroundMiddleware;
+//! use iron_dsc_csrf::{Csrf, CsrfToken, SessionId};
+//! use iron::BeforeMiddleware;
 //! use iron::prelude::*;
 //! use iron::status;
 //!
-//! fn main() {
-//!     let csrf = Csrf::new(extract_token);
+//! struct Token;
 //!
-//!     let handler = csrf.around(Box::new(index));
-//!
-//!     // Make and start the server
-//!     Iron::new(handler); //.http("localhost:8080").unwrap();
+//! impl iron::typemap::Key for Token {
+//!     type Value = String;
 //! }
 //!
-//! fn extract_token(request: &Request) -> Option<String> {
-//!     // Here you can extract the token from the form body, the query string,
-//!     // or anywhere else you like.
+//! struct Id;
 //!
-//!     request.url.query().map(|x| x.to_owned())
+//! impl iron::typemap::Key for Id {
+//!     type Value = SessionId;
+//! }
+//!
+//! struct SetToken;
+//!
+//! impl BeforeMiddleware for SetToken {
+//!     fn before(&self, req: &mut Request) -> Result<(), IronError> {
+//!         // Here you can extract the token from the form body, the query string,
+//!         // or anywhere else you like. In this simple example, we treat the
+//!         // entire query string as the CSRF token.
+//!
+//!         if let Some(x) = req.url.query().map(|x| x.to_owned()) {
+//!             req.extensions.insert::<Token>(x);
+//!         }
+//!
+//!         Ok(())
+//!     }
+//! }
+//!
+//! fn main() {
+//!     let mut chain = Chain::new(index);
+//!     chain.link_around(Csrf::<Token, Id>::new());
+//!     chain.link_before(SetToken);
+//!
+//!     // Make and start the server
+//!     //Iron::new(chain).http("localhost:8080").unwrap();
 //! }
 //!
 //! fn index(request: &mut Request) -> IronResult<Response> {
-//!     let token = request.extensions.get::<Csrf>().unwrap();
+//!     let token = request.extensions.get::<CsrfToken>().unwrap();
 //!     let msg = format!("Hello, CSRF Token: {}", token);
 //!     Ok(Response::with((status::Ok, msg)))
 //! }
@@ -71,6 +93,9 @@ use iron::{headers, typemap, AroundMiddleware, Handler, Headers};
 
 use rand::{OsRng, Rng};
 
+use std::marker::PhantomData;
+use std::net::IpAddr;
+
 use subtle::slices_equal;
 
 mod errors;
@@ -79,42 +104,89 @@ pub use errors::CsrfError;
 
 const COOKIE_NAME: &str = "csrf";
 
-/// An `iron::AroundMiddleware` that provides CSRF protection.
-pub struct Csrf {
-    extract_token: Box<Fn(&Request) -> Option<String> + Sync + Send>,
+/// A unique identifier that can be assigned to all requests in the same session
+#[derive(Debug, Clone)]
+pub enum SessionId {
+    /// Represents a session that is not yet authenticated
+    Anonymous(IpAddr),
+
+    /// Represents a session that has been authenticated (with a user name)
+    Identified(String),
 }
 
-impl Csrf {
-    /// Create a new instance of `Csrf` given a function to extract the CSRF
-    /// token from a request.
-    pub fn new<K: Fn(&Request) -> Option<String> + Sync + Send + 'static>(
-        extract_token: K,
-    ) -> Self {
+/// Convenience trait for representing a token key in an
+/// `iron::typemap::TypeMap`
+pub trait Key<V>: typemap::Key<Value = V> + Send + Sync
+where
+    V: 'static,
+{
+}
+impl<T, V> Key<V> for T
+where
+    T: typemap::Key<Value = V> + Send + Sync,
+    V: 'static,
+{
+}
+
+/// An `iron::AroundMiddleware` that provides CSRF protection.
+#[derive(Default)]
+pub struct Csrf<T, I>
+where
+    T: Key<String>,
+    I: Key<SessionId>,
+{
+    t: PhantomData<T>,
+    i: PhantomData<I>,
+}
+
+impl<T, I> Csrf<T, I>
+where
+    T: Key<String>,
+    I: Key<SessionId>,
+{
+    /// Create a new instance of `Csrf`
+    pub fn new() -> Self {
         Csrf {
-            extract_token: Box::new(extract_token),
+            t: PhantomData,
+            i: PhantomData,
         }
     }
 }
 
-impl typemap::Key for Csrf {
+/// The key for the CSRF token in an `iron::typemap::TypeMap`
+pub struct CsrfToken;
+
+impl typemap::Key for CsrfToken {
     type Value = String;
 }
 
-impl AroundMiddleware for Csrf {
+impl<T, I> AroundMiddleware for Csrf<T, I>
+where
+    T: Key<String>,
+    I: Key<SessionId>,
+{
     fn around(self, handler: Box<Handler>) -> Box<Handler> {
         Box::new(CsrfHandler {
             handler: handler,
-            csrf: self,
+            _csrf: self,
         })
     }
 }
 
-struct CsrfHandler {
+struct CsrfHandler<T, I>
+where
+    T: Key<String>,
+    I: Key<SessionId>,
+{
     handler: Box<Handler>,
-    csrf: Csrf,
+    _csrf: Csrf<T, I>,
 }
 
-impl Handler for CsrfHandler {
+impl<T, I> Handler for CsrfHandler<T, I>
+where
+    T: Key<String>,
+    I: Key<SessionId>,
+{
     fn handle(&self, req: &mut Request) -> IronResult<Response> {
         let state = self.before(req)?;
         let res = self.handler.handle(req)?;
@@ -122,7 +194,11 @@ impl Handler for CsrfHandler {
     }
 }
 
-impl CsrfHandler {
+impl<T, I> CsrfHandler<T, I>
+where
+    T: Key<String>,
+    I: Key<SessionId>,
+{
     fn before(&self, req: &mut Request) -> IronResult<Option<Cookie>> {
         let cookie = self.find_csrf_cookie(&req.headers);
         self.verify_csrf(req, cookie.as_ref())?;
@@ -132,7 +208,7 @@ impl CsrfHandler {
             None => Self::generate_token()?,
         };
 
-        req.extensions.insert::<Csrf>(csrf_token);
+        req.extensions.insert::<CsrfToken>(csrf_token);
 
         Ok(set_cookie)
     }
@@ -182,7 +258,7 @@ impl CsrfHandler {
             None => return Err(CsrfError::CookieMissing.into()),
         };
 
-        let token = match (self.csrf.extract_token)(req) {
+        let token = match req.extensions.get::<T>() {
             Some(x) => x,
             None => return Err(CsrfError::TokenMissing.into()),
         };
@@ -223,18 +299,29 @@ mod tests {
     use super::*;
     use iron::status;
 
-    fn new_impl_none() -> CsrfHandler {
+    struct Token {}
+    impl typemap::Key for Token {
+        type Value = String;
+    }
+
+    struct Id {}
+    impl typemap::Key for Id {
+        type Value = SessionId;
+    }
+
+    fn new_impl_none() -> CsrfHandler<Token, Id> {
         CsrfHandler {
             handler: Box::new(|_: &mut Request| Ok(Response::with(status::NoContent))),
-            csrf: Csrf {
-                extract_token: Box::new(|_| None),
+            _csrf: Csrf {
+                i: PhantomData,
+                t: PhantomData,
             },
         }
     }
 
     #[test]
     fn generate_token() {
-        let (token, cookie) = CsrfHandler::generate_token().unwrap();
+        let (token, cookie) = CsrfHandler::<Token, Id>::generate_token().unwrap();
         assert_eq!(token, cookie.unwrap().value());
         assert!(token.is_ascii());
         assert_eq!(44, token.len());

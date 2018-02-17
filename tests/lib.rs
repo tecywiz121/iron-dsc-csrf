@@ -7,26 +7,57 @@ extern crate iron_dsc_csrf;
 extern crate iron_test;
 
 use iron::prelude::*;
-use iron::{headers, status, AroundMiddleware, Handler, Headers};
+use iron::{headers, status, AroundMiddleware, BeforeMiddleware, Handler, Headers};
 
 use iron_test::{request, response};
 
-use iron_dsc_csrf::{Csrf, CsrfError};
+use iron_dsc_csrf::{Csrf, CsrfError, CsrfToken, SessionId};
 
 struct HelloWorldHandler;
 
 impl Handler for HelloWorldHandler {
     fn handle(&self, req: &mut Request) -> IronResult<Response> {
-        let token = req.extensions.get::<Csrf>().unwrap();
+        let token = req.extensions.get::<CsrfToken>().unwrap();
         assert_eq!(44, token.len());
 
         Ok(Response::with((status::Ok, "Hello, world!")))
     }
 }
 
+struct SetToken {
+    pub session_id: Option<SessionId>,
+    pub token: Option<String>,
+}
+
+impl BeforeMiddleware for SetToken {
+    fn before(&self, req: &mut Request) -> Result<(), IronError> {
+        if let Some(ref x) = self.token {
+            req.extensions.insert::<Token>(x.clone());
+        }
+
+        if let Some(ref x) = self.session_id {
+            req.extensions.insert::<Id>(x.clone());
+        }
+
+        Ok(())
+    }
+}
+
+struct Token;
+
+impl iron::typemap::Key for Token {
+    type Value = String;
+}
+
+struct Id;
+
+impl iron::typemap::Key for Id {
+    type Value = SessionId;
+}
+
 #[test]
 fn hello_world_get() {
-    let handler = Csrf::new(|_| None).around(Box::new(HelloWorldHandler));
+    let handler = Csrf::<Token, Id>::new().around(Box::new(HelloWorldHandler));
     let response = request::get("http://localhost:3000/hello", Headers::new(), &handler).unwrap();
     assert_eq!(response.status, Some(status::Ok));
 
@@ -36,7 +67,7 @@ fn hello_world_get() {
 
 #[test]
 fn post_cookie_missing() {
-    let handler = Csrf::new(|_| None).around(Box::new(HelloWorldHandler));
+    let handler = Csrf::<Token, Id>::new().around(Box::new(HelloWorldHandler));
     let err =
         request::post("http://localhost:3000/hello", Headers::new(), "", &handler).unwrap_err();
 
@@ -50,7 +81,7 @@ fn post_cookie_missing() {
 
 #[test]
 fn post_token_missing() {
-    let handler = Csrf::new(|_| None).around(Box::new(HelloWorldHandler));
+    let handler = Csrf::<Token, Id>::new().around(Box::new(HelloWorldHandler));
 
     let mut headers = Headers::new();
     headers.set(headers::Cookie(vec!["csrf=banana".to_owned()]));
@@ -67,12 +98,17 @@ fn post_token_missing() {
 
 #[test]
 fn post_token_invalid() {
-    let handler = Csrf::new(|_| Some("orange".to_owned())).around(Box::new(HelloWorldHandler));
+    let handler = Csrf::<Token, Id>::new().around(Box::new(HelloWorldHandler));
+    let mut chain = Chain::new(handler);
+    chain.link_before(SetToken {
+        session_id: None,
+        token: Some("orange".to_owned()),
+    });
 
     let mut headers = Headers::new();
     headers.set(headers::Cookie(vec!["csrf=banana".to_owned()]));
 
-    let err = request::post("http://localhost:3000/hello", headers, "", &handler).unwrap_err();
+    let err = request::post("http://localhost:3000/hello", headers, "", &chain).unwrap_err();
 
     assert_matches!(
         err.error.downcast::<CsrfError>().unwrap(),
@@ -86,12 +122,17 @@ const CSRF: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 #[test]
 fn post_token_missing_length() {
-    let handler = Csrf::new(|_| Some(CSRF.to_owned())).around(Box::new(HelloWorldHandler));
+    let handler = Csrf::<Token, Id>::new().around(Box::new(HelloWorldHandler));
+    let mut chain = Chain::new(handler);
+    chain.link_before(SetToken {
+        session_id: None,
+        token: Some(CSRF.to_owned()),
+    });
 
     let mut headers = Headers::new();
     headers.set(headers::Cookie(vec!["csrf=banana".to_owned()]));
 
-    let err = request::post("http://localhost:3000/hello", headers, "", &handler).unwrap_err();
+    let err = request::post("http://localhost:3000/hello", headers, "", &chain).unwrap_err();
 
     assert_matches!(
         err.error.downcast::<CsrfError>().unwrap(),
@@ -103,12 +144,17 @@ fn post_token_missing_length() {
 
 #[test]
 fn hello_world_post() {
-    let handler = Csrf::new(|_| Some(CSRF.to_owned())).around(Box::new(HelloWorldHandler));
+    let handler = Csrf::<Token, Id>::new().around(Box::new(HelloWorldHandler));
+    let mut chain = Chain::new(handler);
+    chain.link_before(SetToken {
+        session_id: None,
+        token: Some(CSRF.to_owned()),
+    });
 
     let mut headers = Headers::new();
     headers.set(headers::Cookie(vec![format!("csrf={}", CSRF)]));
 
-    let response = request::post("http://localhost:3000/hello", headers, "", &handler).unwrap();
+    let response = request::post("http://localhost:3000/hello", headers, "", &chain).unwrap();
 
     assert_eq!(response.status, Some(status::Ok));
 
@@ -119,9 +165,13 @@ fn hello_world_post() {
 #[test]
 fn post_chain_around() {
     let mut chain = Chain::new(HelloWorldHandler);
-    let handler = Csrf::new(|_| Some(CSRF.to_owned()));
+    let handler = Csrf::<Token, Id>::new();
 
     chain.link_around(handler);
+    chain.link_before(SetToken {
+        session_id: None,
+        token: Some(CSRF.to_owned()),
+    });
 
     let mut headers = Headers::new();
     headers.set(headers::Cookie(vec![format!("csrf={}", CSRF)]));
